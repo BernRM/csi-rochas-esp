@@ -25,6 +25,10 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_csi_gain_ctrl.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "driver/spi_slave.h"
 
 #define CONFIG_LESS_INTERFERENCE_CHANNEL   11
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
@@ -41,6 +45,36 @@
 #define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_FORCE_GAIN                   0
 
+// -------- CSI -> SPI framing (custom) --------
+#define CSI_SPI_ENABLE                     1
+#define CSI_PRINT_CSV                      0
+
+#ifndef CSI_SPI_HOST
+#define CSI_SPI_HOST                       SPI2_HOST
+#endif
+
+// Ajuste os pinos conforme o seu hardware
+#ifndef CSI_SPI_MOSI
+#define CSI_SPI_MOSI                       23
+#endif
+#ifndef CSI_SPI_MISO
+#define CSI_SPI_MISO                       19
+#endif
+#ifndef CSI_SPI_SCLK
+#define CSI_SPI_SCLK                       18
+#endif
+#ifndef CSI_SPI_CS
+#define CSI_SPI_CS                         5
+#endif
+
+#define CSI_SPI_QUEUE_LEN                  6
+#define CSI_SPI_MAX_PAYLOAD                4096
+#define CSI_SPI_FRAME_OVERHEAD             4
+#define CSI_SPI_MAX_TRANSFER               (CSI_SPI_MAX_PAYLOAD + CSI_SPI_FRAME_OVERHEAD)
+
+#define CSI_SPI_SENTINEL_0                 0xA5
+#define CSI_SPI_SENTINEL_1                 0x5A
+
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
 #define CSI_FORCE_LLTF                      0
 #endif
@@ -55,6 +89,179 @@
 
 static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const char *TAG = "csi_recv";
+
+typedef struct __attribute__((packed)) {
+    uint8_t  version;
+    uint8_t  type;
+    uint8_t  id;
+    uint8_t  mac[6];
+    int8_t   rssi;
+    uint8_t  rate;
+    uint8_t  sig_mode;
+    uint8_t  mcs;
+    uint8_t  bandwidth;
+    uint8_t  smoothing;
+    uint8_t  not_sounding;
+    uint8_t  aggregation;
+    uint8_t  stbc;
+    uint8_t  fec_coding;
+    uint8_t  sgi;
+    int8_t   noise_floor;
+    uint16_t ampdu_cnt;
+    uint16_t channel;
+    uint8_t  secondary_channel;
+    uint32_t local_timestamp;
+    uint8_t  ant;
+    uint16_t sig_len;
+    uint8_t  rx_state;
+    uint16_t len;
+    uint16_t first_word;
+    uint16_t csi_len;
+} csi_wire_header_t;
+
+typedef struct {
+    uint8_t *frame;
+    size_t len;
+} csi_spi_frame_t;
+
+static QueueHandle_t s_spi_queue = NULL;
+
+static void csi_spi_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        csi_spi_frame_t item = {0};
+        if (xQueueReceive(s_spi_queue, &item, portMAX_DELAY) == pdTRUE) {
+            spi_slave_transaction_t t = {0};
+            t.length = item.len * 8;
+            t.tx_buffer = item.frame;
+
+            esp_err_t err = spi_slave_transmit(CSI_SPI_HOST, &t, portMAX_DELAY);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "spi_slave_transmit failed: %s", esp_err_to_name(err));
+            }
+
+            free(item.frame);
+        }
+    }
+}
+
+static void csi_spi_init(void)
+{
+    if (!CSI_SPI_ENABLE) {
+        return;
+    }
+
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = CSI_SPI_MOSI,
+        .miso_io_num = CSI_SPI_MISO,
+        .sclk_io_num = CSI_SPI_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = CSI_SPI_MAX_TRANSFER,
+    };
+
+    spi_slave_interface_config_t slvcfg = {
+        .mode = 0,
+        .spics_io_num = CSI_SPI_CS,
+        .queue_size = 3,
+        .flags = 0,
+        .post_setup_cb = NULL,
+        .post_trans_cb = NULL,
+    };
+
+    ESP_ERROR_CHECK(spi_slave_initialize(CSI_SPI_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO));
+
+    s_spi_queue = xQueueCreate(CSI_SPI_QUEUE_LEN, sizeof(csi_spi_frame_t));
+    configASSERT(s_spi_queue);
+    xTaskCreatePinnedToCore(csi_spi_task, "csi_spi_task", 4096, NULL, 5, NULL, 0);
+}
+
+static void csi_spi_queue_frame(const wifi_csi_info_t *info, const wifi_pkt_rx_ctrl_t *rx_ctrl,
+                                uint32_t rx_id, float compensate_gain)
+{
+    if (!CSI_SPI_ENABLE || s_spi_queue == NULL) {
+        return;
+    }
+
+#if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
+    uint16_t csi_len = (info->len >= 2) ? (uint16_t)((info->len - 2) / 2) : 0;
+#else
+    uint16_t csi_len = (uint16_t)info->len;
+#endif
+
+    size_t payload_len = sizeof(csi_wire_header_t) + (size_t)csi_len * sizeof(int16_t);
+    if (payload_len == 0 || payload_len > CSI_SPI_MAX_PAYLOAD) {
+        return;
+    }
+
+    size_t frame_len = payload_len + CSI_SPI_FRAME_OVERHEAD;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    if (!frame) {
+        return;
+    }
+
+    frame[0] = CSI_SPI_SENTINEL_0;
+    frame[1] = CSI_SPI_SENTINEL_1;
+    frame[2] = (uint8_t)(payload_len & 0xFF);
+    frame[3] = (uint8_t)((payload_len >> 8) & 0xFF);
+
+    csi_wire_header_t hdr = {0};
+    hdr.version = 1;
+    hdr.type = 1;
+    hdr.id = (uint8_t)(rx_id & 0xFF);
+    memcpy(hdr.mac, info->mac, sizeof(hdr.mac));
+    hdr.rssi = rx_ctrl->rssi;
+    hdr.rate = rx_ctrl->rate;
+    hdr.sig_mode = rx_ctrl->sig_mode;
+    hdr.mcs = rx_ctrl->mcs;
+    hdr.bandwidth = rx_ctrl->cwb;
+    hdr.smoothing = rx_ctrl->smoothing;
+    hdr.not_sounding = rx_ctrl->not_sounding;
+    hdr.aggregation = rx_ctrl->aggregation;
+    hdr.stbc = rx_ctrl->stbc;
+    hdr.fec_coding = rx_ctrl->fec_coding;
+    hdr.sgi = rx_ctrl->sgi;
+    hdr.noise_floor = rx_ctrl->noise_floor;
+    hdr.ampdu_cnt = rx_ctrl->ampdu_cnt;
+    hdr.channel = rx_ctrl->channel;
+    hdr.secondary_channel = rx_ctrl->secondary_channel;
+    hdr.local_timestamp = rx_ctrl->timestamp;
+    hdr.ant = rx_ctrl->ant;
+    hdr.sig_len = rx_ctrl->sig_len;
+    hdr.rx_state = rx_ctrl->rx_state;
+    hdr.len = info->len;
+    hdr.first_word = info->first_word_invalid;
+    hdr.csi_len = csi_len;
+
+    uint8_t *payload = frame + CSI_SPI_FRAME_OVERHEAD;
+    memcpy(payload, &hdr, sizeof(hdr));
+
+    uint8_t *dst = payload + sizeof(hdr);
+#if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
+    if (csi_len > 0) {
+        for (int i = 0, j = 0; i < (info->len - 2) && j < csi_len; i += 2, j++) {
+            int16_t csi = ((int16_t)(((((uint16_t)info->buf[i + 1]) << 8) | info->buf[i]) << 4) >> 4);
+            int16_t v = (int16_t)(compensate_gain * csi);
+            memcpy(dst + (size_t)j * sizeof(int16_t), &v, sizeof(int16_t));
+        }
+    }
+#else
+    for (int i = 0; i < info->len; i++) {
+        int16_t v = (int16_t)(compensate_gain * info->buf[i]);
+        memcpy(dst + (size_t)i * sizeof(int16_t), &v, sizeof(int16_t));
+    }
+#endif
+
+    csi_spi_frame_t item = {
+        .frame = frame,
+        .len = frame_len,
+    };
+
+    if (xQueueSend(s_spi_queue, &item, 0) != pdTRUE) {
+        free(frame);
+    }
+}
 
 static void wifi_init()
 {
@@ -168,6 +375,10 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #endif
 
     uint32_t rx_id = *(uint32_t *)(info->payload + 15);
+#if CSI_SPI_ENABLE
+    csi_spi_queue_frame(info, rx_ctrl, rx_id, compensate_gain);
+#endif
+#if CSI_PRINT_CSV
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
     if (!s_count) {
         ESP_LOGI(TAG, "================ CSI RECV ================");
@@ -206,6 +417,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     }
 #endif
     ets_printf("]\"\n");
+#endif
     s_count++;
 }
 
@@ -293,5 +505,6 @@ void app_main()
 
     wifi_esp_now_init(peer);
 
+    csi_spi_init();
     wifi_csi_init();
 }
