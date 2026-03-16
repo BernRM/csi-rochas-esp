@@ -1,4 +1,4 @@
-/*
+﻿/*
  * SPDX-FileCopyrightText: 2025-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -23,6 +23,10 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_now.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define CONFIG_LESS_INTERFERENCE_CHANNEL   11
 
@@ -33,12 +37,12 @@
 #define CONFIG_WIFI_2G_PROTOCOL             WIFI_PROTOCOL_11N
 #define CONFIG_WIFI_5G_PROTOCOL             WIFI_PROTOCOL_11N
 #else
-#define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT40
+#define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT20
 #endif
 
-#define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT40
+#define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20
 #define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
-#define CONFIG_SEND_FREQUENCY               100
+#define CONFIG_SEND_FREQUENCY               1000
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
@@ -158,13 +162,50 @@ void app_main()
     ESP_LOGI(TAG, "================ CSI SEND ================");
     ESP_LOGI(TAG, "wifi_channel: %d, send_frequency: %d, mac: " MACSTR,
              CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, MAC2STR(CONFIG_CSI_SEND_MAC));
+    ESP_LOGI(TAG, "wifi_bandwidth: %s, espnow_phymode: %s",
+             (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT20) ? "HT20" : "HT40",
+             (CONFIG_ESP_NOW_PHYMODE == WIFI_PHY_MODE_HT20) ? "HT20" : "HT40");
+
+    uint32_t ok_per_sec = 0;
+    uint32_t fail_per_sec = 0;
+    int64_t last_report_us = esp_timer_get_time();
+
+    const int64_t period_us = 1000000LL / CONFIG_SEND_FREQUENCY;
+    int64_t next_send_us = esp_timer_get_time();
 
     for (uint32_t count = 0; ; ++count) {
-        esp_err_t ret = esp_now_send(peer.peer_addr, (const uint8_t *)&count, sizeof(count));
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
+        int64_t now_us = esp_timer_get_time();
+        if (now_us < next_send_us) {
+            esp_rom_delay_us((uint32_t)(next_send_us - now_us));
+        } else if (now_us - next_send_us > (period_us * 5)) {
+            // Evita acumular atraso indefinidamente em caso de preempÃ§Ã£o.
+            next_send_us = now_us;
         }
 
-        usleep(1000 * 1000 / CONFIG_SEND_FREQUENCY);
+        esp_err_t ret = esp_now_send(peer.peer_addr, (const uint8_t *)&count, sizeof(count));
+        if (ret != ESP_OK) {
+            fail_per_sec++;
+        } else {
+            ok_per_sec++;
+        }
+
+        now_us = esp_timer_get_time();
+        if (now_us - last_report_us >= 1000000) {
+            ESP_LOGI(TAG, "tx_stats: ok/s=%lu fail/s=%lu free_heap=%lu",
+                     (unsigned long)ok_per_sec,
+                     (unsigned long)fail_per_sec,
+                     (unsigned long)esp_get_free_heap_size());
+            ok_per_sec = 0;
+            fail_per_sec = 0;
+            last_report_us = now_us;
+        }
+
+        next_send_us += period_us;
+
+        if ((count & 0x1FU) == 0U) {
+            // Cede a CPU periodicamente para o IDLE task e evita task watchdog.
+            vTaskDelay(1);
+            next_send_us = esp_timer_get_time() + period_us;
+        }
     }
 }

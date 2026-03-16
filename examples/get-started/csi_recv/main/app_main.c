@@ -38,10 +38,10 @@
 #define CONFIG_WIFI_2G_PROTOCOL             WIFI_PROTOCOL_11N
 #define CONFIG_WIFI_5G_PROTOCOL             WIFI_PROTOCOL_11N
 #else
-#define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT40
+#define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT20
 #endif
 
-#define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT40
+#define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20
 #define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_FORCE_GAIN                   0
 
@@ -67,13 +67,14 @@
 #define CSI_SPI_CS                         5
 #endif
 
-#define CSI_SPI_QUEUE_LEN                  6
+#define CSI_SPI_QUEUE_LEN                  32
 #define CSI_SPI_MAX_PAYLOAD                4096
 #define CSI_SPI_FRAME_OVERHEAD             4
 #define CSI_SPI_MAX_TRANSFER               (CSI_SPI_MAX_PAYLOAD + CSI_SPI_FRAME_OVERHEAD)
 
 #define CSI_SPI_SENTINEL_0                 0xA5
 #define CSI_SPI_SENTINEL_1                 0x5A
+#define CSI_FAST_MODE_LLTF_ONLY            1
 
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
 #define CSI_FORCE_LLTF                      0
@@ -88,6 +89,7 @@
 #endif
 
 static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t CONFIG_CSI_RECV_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x01};
 static const char *TAG = "csi_recv";
 
 typedef struct __attribute__((packed)) {
@@ -125,6 +127,9 @@ typedef struct {
 } csi_spi_frame_t;
 
 static QueueHandle_t s_spi_queue = NULL;
+static uint32_t s_csi_cb_count = 0;
+static uint32_t s_spi_enq_count = 0;
+static uint32_t s_spi_drop_count = 0;
 
 static void csi_spi_task(void *arg)
 {
@@ -164,7 +169,7 @@ static void csi_spi_init(void)
     spi_slave_interface_config_t slvcfg = {
         .mode = 0,
         .spics_io_num = CSI_SPI_CS,
-        .queue_size = 3,
+        .queue_size = 8,
         .flags = 0,
         .post_setup_cb = NULL,
         .post_trans_cb = NULL,
@@ -260,7 +265,11 @@ static void csi_spi_queue_frame(const wifi_csi_info_t *info, const wifi_pkt_rx_c
 
     if (xQueueSend(s_spi_queue, &item, 0) != pdTRUE) {
         free(frame);
+        s_spi_drop_count++;
+        return;
     }
+
+    s_spi_enq_count++;
 }
 
 static void wifi_init()
@@ -323,7 +332,7 @@ static void wifi_init()
     }
 #endif
 
-    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
+    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_RECV_MAC));
 }
 
 static void wifi_esp_now_init(esp_now_peer_info_t peer)
@@ -352,6 +361,8 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
 
+    s_csi_cb_count++;
+
     const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
     static int s_count = 0;
     float compensate_gain = 1.0f;
@@ -377,6 +388,12 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     uint32_t rx_id = *(uint32_t *)(info->payload + 15);
 #if CSI_SPI_ENABLE
     csi_spi_queue_frame(info, rx_ctrl, rx_id, compensate_gain);
+    if ((s_csi_cb_count % 1000U) == 0U) {
+        ESP_LOGI(TAG, "rx_stats: csi_cb=%lu spi_enq=%lu spi_drop=%lu",
+                 (unsigned long)s_csi_cb_count,
+                 (unsigned long)s_spi_enq_count,
+                 (unsigned long)s_spi_drop_count);
+    }
 #endif
 #if CSI_PRINT_CSV
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
@@ -461,8 +478,8 @@ static void wifi_csi_init()
 #else
     wifi_csi_config_t csi_config = {
         .lltf_en           = true,
-        .htltf_en          = true,
-        .stbc_htltf2_en    = true,
+        .htltf_en          = !CSI_FAST_MODE_LLTF_ONLY,
+        .stbc_htltf2_en    = !CSI_FAST_MODE_LLTF_ONLY,
         .ltf_merge_en      = true,
         .channel_filter_en = true,
         .manu_scale        = false,
@@ -504,6 +521,14 @@ void app_main()
     };
 
     wifi_esp_now_init(peer);
+
+    ESP_LOGI(TAG, "================ CSI RECV ================");
+    ESP_LOGI(TAG, "wifi_channel: %d, filter_mac: " MACSTR ", recv_mac: " MACSTR,
+             CONFIG_LESS_INTERFERENCE_CHANNEL, MAC2STR(CONFIG_CSI_SEND_MAC), MAC2STR(CONFIG_CSI_RECV_MAC));
+    ESP_LOGI(TAG, "wifi_bandwidth: %s, espnow_phymode: %s",
+             (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT20) ? "HT20" : "HT40",
+             (CONFIG_ESP_NOW_PHYMODE == WIFI_PHY_MODE_HT20) ? "HT20" : "HT40");
+    ESP_LOGI(TAG, "csi_fast_mode_lltf_only: %d", CSI_FAST_MODE_LLTF_ONLY);
 
     csi_spi_init();
     wifi_csi_init();
