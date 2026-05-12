@@ -25,6 +25,7 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_csi_gain_ctrl.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -68,9 +69,9 @@
 #endif
 
 #define CSI_SPI_QUEUE_LEN                  32
-#define CSI_SPI_MAX_PAYLOAD                4096
 #define CSI_SPI_FRAME_OVERHEAD             4
-#define CSI_SPI_MAX_TRANSFER               (CSI_SPI_MAX_PAYLOAD + CSI_SPI_FRAME_OVERHEAD)
+#define CSI_SPI_MAX_TRANSFER               1024
+#define CSI_SPI_MAX_PAYLOAD                (CSI_SPI_MAX_TRANSFER - CSI_SPI_FRAME_OVERHEAD)
 
 #define CSI_SPI_SENTINEL_0                 0xA5
 #define CSI_SPI_SENTINEL_1                 0x5A
@@ -200,8 +201,14 @@ static void csi_spi_queue_frame(const wifi_csi_info_t *info, const wifi_pkt_rx_c
         return;
     }
 
-    size_t frame_len = payload_len + CSI_SPI_FRAME_OVERHEAD;
-    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    /*
+     * The Raspberry SPI master clocks a fixed-size transaction per read. Keep
+     * the slave transaction fixed and zero-padded; otherwise a short master
+     * read truncates the tail of this frame and the next sentinel can be parsed
+     * as CSI data.
+     */
+    size_t frame_len = CSI_SPI_MAX_TRANSFER;
+    uint8_t *frame = (uint8_t *)heap_caps_calloc(1, frame_len, MALLOC_CAP_DMA);
     if (!frame) {
         return;
     }
