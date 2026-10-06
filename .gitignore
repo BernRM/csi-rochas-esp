@@ -87,3 +87,6 @@ docs/docusaurus/website/node_modules
 **/managed_components/
 **/*.lock
 **/.vscode
+
+# Worktree historica congelada, preservada como evidencia fora deste repo.
+02_CICLOS_ANALISE/
